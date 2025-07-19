@@ -1,3 +1,4 @@
+# vllm/model_executor/layers/quantization/bitsandbytes.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -585,10 +586,75 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
+        params_dtype: torch.dtype,  # Original precision (e.g., float16)
         **extra_weight_attrs,
     ):
-        raise NotImplementedError
+        """
+        Creates the empty 8-bit quantized weight parameters for MoE experts.
+        These parameters are instances of `bitsandbytes.nn.Int8Params`,
+        which store 8-bit data and associated metadata.
+        """
+        from bitsandbytes.nn import Int8Params
+
+        # For 8-bit quantization, each original floating-point value is
+        # quantized to one 8-bit integer. There is no bit-packing within bytes.
+        # So, the size of the storage tensor is simply the total number of logical elements.
+
+        # Fused gate_up_proj (w13): Column parallel expert weights.
+        # Conceptual unquantized shape for one expert's w13:
+        # (2 * intermediate_size_per_partition, hidden_size)
+        # Total elements for one expert's w13:
+        # (2 * intermediate_size_per_partition) * hidden_size
+        w13_total_elements = (2 * intermediate_size_per_partition) * hidden_size
+        w13_qweight = Int8Params(
+            # The data tensor holds `num_experts` batches of flattened 8-bit weights.
+            # Shape: (num_experts, flattened_weight_elements_per_expert)
+            data=torch.empty(num_experts, w13_total_elements, dtype=torch.int8),
+            has_fp16_weights=self.quant_config.llm_int8_has_fp16_weight,
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+        set_weight_attrs(
+            w13_qweight,
+            {
+                "num_experts": num_experts,
+                "input_dim": hidden_size,
+                "output_dim": 2 * intermediate_size_per_partition,
+                # 'experts_shape' is the conceptual unquantized shape (E, Output_Dim, Input_Dim).
+                # This shape is used later to reshape the dequantized weights during the forward pass.
+                "experts_shape": (num_experts, intermediate_size_per_partition * 2, hidden_size),
+                "pack_factor": 1,  # Each 8-bit value occupies its own byte, no bit-packing.
+                "use_bitsandbytes_8bit": True,  # Flag to identify this as BNB 8-bit.
+                "generation": 0  # Used by BNB for internal profiling/initialization.
+            }
+        )
+
+        # down_proj (w2): Row parallel expert weights.
+        # Conceptual unquantized shape for one expert's w2: (hidden_size, intermediate_size_per_partition)
+        # Total elements for one expert's w2: hidden_size * intermediate_size_per_partition
+        w2_total_elements = hidden_size * intermediate_size_per_partition
+        w2_qweight = Int8Params(
+            # Shape: (num_experts, flattened_weight_elements_per_expert)
+            data=torch.empty(num_experts, w2_total_elements, dtype=torch.int8),
+            has_fp16_weights=self.quant_config.llm_int8_has_fp16_weight,
+            requires_grad=False
+        )
+        layer.register_parameter("w2_weight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+        set_weight_attrs(
+            w2_qweight,
+            {
+                "num_experts": num_experts,
+                "input_dim": intermediate_size_per_partition,
+                "output_dim": hidden_size,
+                # 'experts_shape' is the conceptual unquantized shape (E, Output_Dim, Input_Dim).
+                "experts_shape": (num_experts, hidden_size, intermediate_size_per_partition),
+                "pack_factor": 1,  # Each 8-bit value occupies its own byte.
+                "use_bitsandbytes_8bit": True,
+                "generation": 0
+            }
+        )
 
     def _apply_4bit_dequnt(
             self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -607,4 +673,94 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
 
     def _apply_8bit_dequant(
             self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        """
+        Dequantizes the 8-bit quantized MoE expert weights (w13 and w2)
+        from `Int8Params` representation to full-precision (float16/bfloat16).
+        This involves using the stored 8-bit data and their corresponding scales (.SCB tensors).
+        """
+        from bitsandbytes.nn import Int8Params
+        import warnings # Add import for warnings
+
+        # Retrieve the 8-bit quantized weight parameters from the layer.
+        w13_qweight: Int8Params = layer.w13_weight
+        w2_qweight: Int8Params = layer.w2_weight
+
+        # Determine the target dequantized dtype.
+        # This should ideally be the `params_dtype` used during create_weights,
+        # or the default compute dtype.
+        target_dtype = layer.params_dtype if hasattr(layer, 'params_dtype') else torch.bfloat16
+
+        # --- Dequantize w13 (Fused gate_up_proj) ---
+        # Get the 8-bit data (CB tensor) and its corresponding scale (SCB tensor)
+        w13_8bit_data = w13_qweight.data # This is the quantized int8 data (CB tensor)
+        w13_scales = w13_qweight.SCB.to(w13_8bit_data.device) # This is the scale tensor (SCB tensor)
+
+        # Reshape the 8-bit data to its conceptual original shape (num_experts, Output_Dim, Input_Dim)
+        # and convert to float for multiplication.
+        # w13_qweight.experts_shape is (num_experts, 2 * intermediate_size_per_partition, hidden_size)
+        w13_float = w13_8bit_data.view(w13_qweight.experts_shape).float()
+
+        # Apply the scales. SCB for 8-bit Linear8bitLt is typically per-output-feature.
+        # So, w13_scales should have shape (num_experts, Output_Dim).
+        # We need to unsqueeze it to (num_experts, Output_Dim, 1) for correct broadcasting during multiplication.
+        if w13_scales.ndim == 2 and w13_scales.shape[1] == w13_qweight.experts_shape[1]:
+            # This is the expected shape (num_experts, Output_Dim)
+            w13 = w13_float * w13_scales.unsqueeze(-1)
+        elif w13_scales.ndim == 1 and w13_scales.shape[0] == w13_qweight.experts_shape[1]:
+            # If SCB is 1D (Output_Dim,) but needs to be applied per expert (less common for MoE, but possible if it's a global scale per output dim)
+            warnings.warn(
+                f"w13_scales is 1D ({w13_scales.shape}), but expected 2D (num_experts, output_dim) or (num_experts,) for 8-bit MoE. "
+                f"Assuming it's a shared scale per output dimension and unsqueezing. Check for accuracy."
+            )
+            # Expand to (1, Output_Dim, 1) then broadcast over experts
+            w13 = w13_float * w13_scales.unsqueeze(0).unsqueeze(-1)
+        else:
+            # Fallback for other unexpected SCB shapes. This might mean the scales are per-expert (single value per expert)
+            # or some other global scale. This is a heuristic and might need adjustment based on the actual model's quantization.
+            warnings.warn(
+                f"Unexpected w13_scales shape {w13_scales.shape} for 8-bit MoE dequantization. "
+                f"Expected (num_experts, output_dim) or (output_dim,). "
+                f"Experts shape is {w13_qweight.experts_shape}. Attempting per-expert global scaling if numel matches."
+            )
+            if w13_scales.numel() == w13_qweight.experts_shape[0]: # If SCB is (num_experts,) meaning a single scale per expert
+                 w13 = w13_float * w13_scales.view(w13_qweight.experts_shape[0], 1, 1)
+            else: # Generic fallback, might not be accurate
+                 raise ValueError(
+                    f"Cannot dequantize w13 with unexpected SCB shape {w13_scales.shape} and experts_shape {w13_qweight.experts_shape}. "
+                    "Manual inspection of scales layout required."
+                 )
+
+
+        # --- Dequantize w2 (Down projection) ---
+        w2_8bit_data = w2_qweight.data
+        w2_scales = w2_qweight.SCB.to(w2_8bit_data.device)
+        
+        w2_float = w2_8bit_data.view(w2_qweight.experts_shape).float()
+
+        if w2_scales.ndim == 2 and w2_scales.shape[1] == w2_qweight.experts_shape[1]:
+             w2 = w2_float * w2_scales.unsqueeze(-1)
+        elif w2_scales.ndim == 1 and w2_scales.shape[0] == w2_qweight.experts_shape[1]:
+            warnings.warn(
+                f"w2_scales is 1D ({w2_scales.shape}), but expected 2D (num_experts, output_dim) or (num_experts,) for 8-bit MoE. "
+                f"Assuming it's a shared scale per output dimension and unsqueezing. Check for accuracy."
+            )
+            w2 = w2_float * w2_scales.unsqueeze(0).unsqueeze(-1)
+        else:
+            warnings.warn(
+                f"Unexpected w2_scales shape {w2_scales.shape} for 8-bit MoE dequantization. "
+                f"Expected (num_experts, output_dim) or (output_dim,). "
+                f"Experts shape is {w2_qweight.experts_shape}. Attempting per-expert global scaling if numel matches."
+            )
+            if w2_scales.numel() == w2_qweight.experts_shape[0]:
+                w2 = w2_float * w2_scales.view(w2_qweight.experts_shape[0], 1, 1)
+            else:
+                raise ValueError(
+                    f"Cannot dequantize w2 with unexpected SCB shape {w2_scales.shape} and experts_shape {w2_qweight.experts_shape}. "
+                    "Manual inspection of scales layout required."
+                )
+
+        # Convert to target dtype
+        w13 = w13.to(target_dtype)
+        w2 = w2.to(target_dtype)
+
+        return w13, w2

@@ -302,7 +302,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
 
             if (f"{mapped_weight_name}.quant_state.bitsandbytes__nf4"
                     in temp_state_dict) or (
-                        f"{mapped_weight_name}.quant_state.bitsandbytes__fp4"
+                        f"{mapped_name}.quant_state.bitsandbytes__fp4"
                         in temp_state_dict):
                 quant_state = _parse_quant_state(mapped_weight_name,
                                                  temp_state_dict)
@@ -745,8 +745,18 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             if weights_not_loaded:
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")
-        expert_quant_state_dict = self._fuse_moe_quant_states(
-            model, quant_state_dict)
+
+        # MODIFICATION START: Skip fusing quant states for 8-bit pre-quantized models.
+        # This function is primarily for combining 4-bit QuantState objects.
+        # For 8-bit pre-quantized models, the dequantization logic is
+        # handled directly by the Int8Params object's .dequant() method,
+        # so explicit fusion of quant_state objects here is not needed.
+        if self.pre_quant and self.load_8bit:
+            expert_quant_state_dict = {}  # Initialize as empty dictionary
+        else:
+            expert_quant_state_dict = self._fuse_moe_quant_states(
+                model, quant_state_dict)
+        # MODIFICATION END
 
         stacked_quant_state_dict = self._stack_quantization_states(
             model, quant_state_dict)
