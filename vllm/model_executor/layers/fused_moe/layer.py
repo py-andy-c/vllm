@@ -1019,25 +1019,70 @@ class FusedMoE(torch.nn.Module):
             param.data.copy_(loaded_weight)
             return True if return_success else None
 
-        # Case for BitsAndBytes
+        # Case for BitsAndBytes (BOTH 4-bit and 8-bit)
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-        if use_bitsandbytes_4bit:
-            shard_dim = 0
+        use_bitsandbytes_8bit = getattr(param, "use_bitsandbytes_8bit", False)
+        if use_bitsandbytes_4bit or use_bitsandbytes_8bit:
+            # For BNB weights, the `param.data[expert_id]` points to the
+            # pre-allocated, flattened space for the entire fused weight
+            # (e.g., w13_weight combines gate_proj and up_proj).
+            # The `loaded_weight` here is either the gate_proj part (w1)
+            # or the up_proj part (w3), or the full down_proj (w2).
 
-            expert_data = param.data[expert_id]
-            if shard_id == "w2":
-                expert_data.copy_(loaded_weight)
-            elif shard_id in ("w1", "w3"):
-                # BNB inflight quantization has already sharded the weights
-                full_load = True
-                self._load_w13(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                    load_full=full_load,
-                )
+            # Get the flattened view of the pre-allocated parameter slice for this expert.
+            expert_param_slice = param.data[expert_id]
+
+            # Flatten the incoming loaded_weight.
+            flattened_loaded_weight = loaded_weight.reshape(-1)
+
+            if shard_id in ("w1", "w3"):
+                # This block handles `w1` (gate_proj) and `w3` (up_proj) which
+                # are components of the larger `w13_weight` parameter.
+                # The `_create_weights_8bit` (or 4bit) function sets `output_dim`
+                # on the `param` to be the *total fused output dim* (2 * intermediate_size_per_partition).
+                # `input_dim` is `hidden_size`.
+
+                fused_output_dim = getattr(param, "output_dim") # This is (2 * intermediate_size_per_partition)
+                input_dim = getattr(param, "input_dim") # This is hidden_size
+
+                # Calculate the expected flattened size for a single component (e.g., just w1 or just w3).
+                # A single component's output dim is half of the fused output dim.
+                single_component_flattened_size = (fused_output_dim // 2) * input_dim
+
+                if flattened_loaded_weight.numel() != single_component_flattened_size:
+                    raise ValueError(
+                        f"Shape mismatch for BitsAndBytes MoE weight '{weight_name}' (shard_id='{shard_id}', expert {expert_id}): "
+                        f"Expected loaded weight to have {single_component_flattened_size} elements for one component "
+                        f"(derived from total output_dim={fused_output_dim}, input_dim={input_dim}), "
+                        f"but got {flattened_loaded_weight.numel()} elements (original shape {loaded_weight.shape}). "
+                        f"This indicates a problem with the loaded weight's dimensions or initial sharding."
+                    )
+
+                # Determine the correct offset within the `expert_param_slice`.
+                # 'w1' goes into the first half, 'w3' goes into the second half.
+                offset_in_fused_param = 0
+                if shard_id == "w3":
+                    offset_in_fused_param = single_component_flattened_size
+
+                # Copy the `flattened_loaded_weight` into the correct sub-slice of `expert_param_slice`.
+                expert_param_slice[
+                    offset_in_fused_param : offset_in_fused_param + flattened_loaded_weight.numel()
+                ].copy_(flattened_loaded_weight)
+
+            elif shard_id == "w2":
+                # For `w2_weight` (down_proj), it is not a fused weight. The `loaded_weight`
+                # for `w2` should directly match the size of `expert_param_slice` for this expert.
+                if expert_param_slice.shape != flattened_loaded_weight.shape:
+                    raise ValueError(
+                        f"Shape mismatch for BitsAndBytes MoE weight '{weight_name}' (shard_id='{shard_id}', expert {expert_id}): "
+                        f"Expected flattened shape {expert_param_slice.shape} for parameter slice "
+                        f"but loaded weight has flattened shape {flattened_loaded_weight.shape} "
+                        f"(original shape {loaded_weight.shape}). "
+                        f"This usually means the loaded weight for this expert is not correctly sharded or flattened "
+                        f"for the current TP rank to match the pre-allocated parameter shape."
+                    )
+                expert_param_slice.copy_(flattened_loaded_weight)
+            
             return True if return_success else None
 
         # is_transposed: if the dim to shard the weight
@@ -1173,7 +1218,7 @@ class FusedMoE(torch.nn.Module):
             return True if return_success else None
 
         return False if return_success else None
-
+        
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         weights = list(self.named_parameters())
         assert all(weight.is_contiguous() for _, weight in weights)
