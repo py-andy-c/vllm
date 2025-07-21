@@ -588,7 +588,73 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        raise NotImplementedError
+        """
+        Creates the empty 8-bit quantized weight parameters for MoE experts.
+        These parameters are instances of `bitsandbytes.nn.Int8Params`,
+        which store 8-bit data and associated metadata.
+        """
+        print("aaaaaa _create_weights_8bit")
+        from bitsandbytes.nn import Int8Params
+
+        # For 8-bit quantization, each original floating-point value is
+        # quantized to one 8-bit integer. There is no bit-packing within bytes.
+        # So, the size of the storage tensor is simply the total number of logical elements.
+
+        # Fused gate_up_proj (w13): Column parallel expert weights.
+        # Conceptual unquantized shape for one expert's w13:
+        # (2 * intermediate_size_per_partition, hidden_size)
+        # Total elements for one expert's w13:
+        # (2 * intermediate_size_per_partition) * hidden_size
+        w13_total_elements = (2 * intermediate_size_per_partition) * hidden_size
+        w13_qweight = Int8Params(
+            # The data tensor holds `num_experts` batches of flattened 8-bit weights.
+            # Shape: (num_experts, flattened_weight_elements_per_expert)
+            data=torch.empty(num_experts, w13_total_elements, dtype=torch.int8),
+            has_fp16_weights=self.quant_config.llm_int8_has_fp16_weight,
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+        set_weight_attrs(
+            w13_qweight,
+            {
+                "num_experts": num_experts,
+                "input_dim": hidden_size,
+                "output_dim": 2 * intermediate_size_per_partition,
+                # 'experts_shape' is the conceptual unquantized shape (E, Output_Dim, Input_Dim).
+                # This shape is used later to reshape the dequantized weights during the forward pass.
+                "experts_shape": (num_experts, intermediate_size_per_partition * 2, hidden_size),
+                "pack_factor": 1,  # Each 8-bit value occupies its own byte, no bit-packing.
+                "use_bitsandbytes_8bit": True,  # Flag to identify this as BNB 8-bit.
+                "generation": 0  # Used by BNB for internal profiling/initialization.
+            }
+        )
+
+        # down_proj (w2): Row parallel expert weights.
+        # Conceptual unquantized shape for one expert's w2: (hidden_size, intermediate_size_per_partition)
+        # Total elements for one expert's w2: hidden_size * intermediate_size_per_partition
+        w2_total_elements = hidden_size * intermediate_size_per_partition
+        w2_qweight = Int8Params(
+            # Shape: (num_experts, flattened_weight_elements_per_expert)
+            data=torch.empty(num_experts, w2_total_elements, dtype=torch.int8),
+            has_fp16_weights=self.quant_config.llm_int8_has_fp16_weight,
+            requires_grad=False
+        )
+        layer.register_parameter("w2_weight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+        set_weight_attrs(
+            w2_qweight,
+            {
+                "num_experts": num_experts,
+                "input_dim": intermediate_size_per_partition,
+                "output_dim": hidden_size,
+                # 'experts_shape' is the conceptual unquantized shape (E, Output_Dim, Input_Dim).
+                "experts_shape": (num_experts, hidden_size, intermediate_size_per_partition),
+                "pack_factor": 1,  # Each 8-bit value occupies its own byte.
+                "use_bitsandbytes_8bit": True,
+                "generation": 0
+            }
+        )
 
     def _apply_4bit_dequnt(
             self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -607,4 +673,19 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
 
     def _apply_8bit_dequant(
             self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError
+        print("aaaaaa _apply_8bit_dequant")
+        print(f"aaaaaa {layer.w13_weight=}")
+        print(f"aaaaaa {layer.w13_weight.shape=}")
+        print(f"aaaaaa {layer.w2_weight=}")
+        print(f"aaaaaa {layer.w2_weight.shape=}")
+
+        return _dequant_8bit_tensor(layer.w13_weight), _dequant_8bit_tensor(layer.w2_weight)
+        
+    
+def _dequant_8bit_tensor(tensor: "bitsandbytes.nn.Int8Params") -> torch.Tensor:
+    from bitsandbytes.functional import int8_vectorwise_dequant
+    print(f"aaaaa {tensor.data=}")
+    print(f"aaaaa {tensor.SCB=}")
+    dequantized_weight = int8_vectorwise_dequant(tensor.data, tensor.SCB)
+    print(f"aaaaa {dequantized_weight.shape=}")
+    print(f"aaaaa {dequantized_weight.dtype=}")

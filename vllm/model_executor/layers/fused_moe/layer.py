@@ -920,7 +920,7 @@ class FusedMoE(torch.nn.Module):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        expert_data.copy_(loaded_weight)
+        expert_data.copy_(loaded_weight.reshape(-1))
 
     def _load_w2(self,
                  expert_data: torch.Tensor,
@@ -1021,12 +1021,13 @@ class FusedMoE(torch.nn.Module):
 
         # Case for BitsAndBytes
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-        if use_bitsandbytes_4bit:
+        use_bitsandbytes_8bit = getattr(param, "use_bitsandbytes_8bit", False)
+        if use_bitsandbytes_4bit or use_bitsandbytes_8bit:
             shard_dim = 0
 
             expert_data = param.data[expert_id]
             if shard_id == "w2":
-                expert_data.copy_(loaded_weight)
+                expert_data.copy_(loaded_weight.reshape(-1))
             elif shard_id in ("w1", "w3"):
                 # BNB inflight quantization has already sharded the weights
                 full_load = True

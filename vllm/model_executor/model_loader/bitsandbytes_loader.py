@@ -745,8 +745,11 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             if weights_not_loaded:
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")
-        expert_quant_state_dict = self._fuse_moe_quant_states(
-            model, quant_state_dict)
+        if self.pre_quant and self.load_8bit:
+            expert_quant_state_dict = {}  # Initialize as empty dictionary
+        else:
+            expert_quant_state_dict = self._fuse_moe_quant_states(
+                model, quant_state_dict)
 
         stacked_quant_state_dict = self._stack_quantization_states(
             model, quant_state_dict)
