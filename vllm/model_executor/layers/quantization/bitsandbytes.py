@@ -670,22 +670,49 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         w13 = w13.reshape(layer.w13_weight.experts_shape)
         w2 = w2.reshape(layer.w2_weight.experts_shape)
         return w13, w2
-
+    
     def _apply_8bit_dequant(
             self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Dequantizes the 8-bit quantized MoE expert weights (w13 and w2)
+        using the functional API from bitsandbytes.
+        """
+        from bitsandbytes.functional import int8_vectorwise_dequant
+        from bitsandbytes.nn import Int8Params
         print("aaaaaa _apply_8bit_dequant")
         print(f"aaaaaa {layer.w13_weight=}")
         print(f"aaaaaa {layer.w13_weight.shape=}")
         print(f"aaaaaa {layer.w2_weight=}")
         print(f"aaaaaa {layer.w2_weight.shape=}")
 
-        return _dequant_8bit_tensor(layer.w13_weight), _dequant_8bit_tensor(layer.w2_weight)
-        
-    
-def _dequant_8bit_tensor(tensor: "bitsandbytes.nn.Int8Params") -> torch.Tensor:
-    from bitsandbytes.functional import int8_vectorwise_dequant
-    print(f"aaaaa {tensor.data=}")
-    print(f"aaaaa {tensor.SCB=}")
-    dequantized_weight = int8_vectorwise_dequant(tensor.data, tensor.SCB)
-    print(f"aaaaa {dequantized_weight.shape=}")
-    print(f"aaaaa {dequantized_weight.dtype=}")
+        def _dequant_8bit_expert_tensor(qweight: Int8Params) -> torch.Tensor:
+            """Helper function to dequantize a single Int8Params expert tensor."""
+            # The BitsAndBytesModelLoader now populates the .SCB attribute directly
+            # onto the Int8Params object for MoE layers.
+            scales = qweight.SCB
+            
+            if scales is None:
+                raise ValueError(
+                    f"Quantization scales (SCB) not found for 8-bit MoE weight. "
+                    f"The .SCB attribute on the Int8Params object is None. "
+                    f"Weight shape: {qweight.shape}"
+                )
+
+            # The `int8_vectorwise_dequant` function expects the scales tensor.
+            dequantized_weight = int8_vectorwise_dequant(qweight.data, scales)
+
+            # Reshape the dequantized tensor to its logical 2D/3D shape.
+            # The `experts_shape` attribute was set during `_create_weights_8bit`.
+            dequantized_weight = dequantized_weight.reshape(qweight.experts_shape)
+
+            return dequantized_weight
+
+        w13 = _dequant_8bit_expert_tensor(layer.w13_weight)
+        w2 = _dequant_8bit_expert_tensor(layer.w2_weight)
+
+        # Ensure the output dtype matches the model's computation dtype
+        target_dtype = layer.params_dtype if hasattr(layer, 'params_dtype') else torch.bfloat16
+        w13 = w13.to(target_dtype)
+        w2 = w2.to(target_dtype)
+
+        return w13, w2
