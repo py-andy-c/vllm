@@ -429,15 +429,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                         f"MoE Model {type(model).__name__} does not support "
                         "BitsAndBytes quantization yet. Ensure this model has "
                         "'get_expert_mapping' method.")
-                # TODO: support FusedMoE with prequant and 8bit.
-                if self.pre_quant:
-                    raise ValueError(
-                        "Prequant BitsAndBytes models with FusedMoE is not "
-                        "supported yet.")
-                if self.load_8bit:
-                    raise ValueError(
-                        "BitsAndBytes 8bit quantization with FusedMoE is not "
-                        "supported yet.")
                 # Get the corresponding weight name using module name and
                 # get_expert_mapping.
                 expert_mapping = model.get_expert_mapping()
@@ -704,13 +695,35 @@ class BitsAndBytesModelLoader(BaseModelLoader):
     def _bind_quant_states_to_params(self, model: nn.Module,
                                      stacked_quant_state_dict: dict) -> None:
         # save quant_states and offsets as the attributes of the parameters
+        from bitsandbytes.nn import Int8Params
         param_dict = dict(model.named_parameters())
         for param_name, param in param_dict.items():
             if param_name in stacked_quant_state_dict:
                 quant_states = stacked_quant_state_dict[param_name]
-                # Dequantize double quantized values during weight loading.
-                self._dequantize_dq(quant_states)
-                set_weight_attrs(param, {"bnb_quant_state": quant_states})
+                
+                if self.load_8bit and isinstance(param, Int8Params):
+                    # For pre-quantized 8-bit models (like MoE), the quant_states
+                    # dictionary holds the SCB tensors. We need to attach these
+                    # directly to the .SCB attribute of the Int8Params object.
+                    # We assume a single shard for pre-quantized models (TP > 1 is blocked).
+                    if 0 in quant_states:
+                        actual_scb = quant_states[0]
+                    else:
+                        # Handle cases where it might not be a stacked dict
+                        actual_scb = quant_states
+                    
+                    # Use direct setattr to overwrite the potentially dummy .SCB
+                    # created during the initial .to(device) call on the Int8Params object.
+                    # This is the correct scale tensor loaded from the checkpoint's .scb file.
+                    if hasattr(param, "SCB"):
+                        assert param.SCB is None
+                    setattr(param, "SCB", actual_scb)
+                    set_weight_attrs(param, {"bnb_quant_state": quant_states})
+                else:
+                    # Dequantize double quantized values during weight loading.
+                    self._dequantize_dq(quant_states)
+                    set_weight_attrs(param, {"bnb_quant_state": quant_states})
+                    
                 if not isinstance(quant_states, dict):
                     continue
 
@@ -722,7 +735,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 num_elements = [0] * len(quant_states)
                 for seq, quant_state in quant_states.items():
                     num_elements[seq] = (math.prod(quant_state.shape) //
-                                         pack_ratio)
+                                            pack_ratio)
 
                 offsets = np.concatenate(([0], np.cumsum(num_elements)))
                 # Make torch infer_schema happy
@@ -754,8 +767,11 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             if weights_not_loaded:
                 raise ValueError("Following weights were not initialized from "
                                  f"checkpoint: {weights_not_loaded}")
-        expert_quant_state_dict = self._fuse_moe_quant_states(
-            model, quant_state_dict)
+        if self.pre_quant and self.load_8bit:
+            expert_quant_state_dict = {}  # Initialize as empty dictionary
+        else:
+            expert_quant_state_dict = self._fuse_moe_quant_states(
+                model, quant_state_dict)
 
         stacked_quant_state_dict = self._stack_quantization_states(
             model, quant_state_dict)
