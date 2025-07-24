@@ -122,7 +122,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.num_experts,
                                      bias=False,
-                                     quant_config=None,
+                                     quant_config=quant_config,
                                      prefix=f"{prefix}.gate")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -474,7 +474,9 @@ class Qwen3MoeModel(nn.Module):
                             continue
                         else:
                             name = remapped_kv_scale_name
+                    print(f"dddddd {name=}")
                     param = params_dict[name]
+                    print(f"dddddd {param=}")
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)

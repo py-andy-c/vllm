@@ -1028,7 +1028,17 @@ class FusedMoE(torch.nn.Module):
 
         # Case for BitsAndBytes
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-        if use_bitsandbytes_4bit:
+        use_bitsandbytes_8bit = getattr(param, "use_bitsandbytes_8bit", False)
+        print(f"bbbbbbb {param=}")
+        print(f"bbbbbbb {param.data.shape=}")
+        print(f"bbbbbbb {param.data.dtype=}")
+        print(f"bbbbbbb {loaded_weight=}")
+        print(f"bbbbbbb {loaded_weight.shape=}")
+        print(f"bbbbbbb {loaded_weight.dtype=}")
+        print(f"bbbbbbb {weight_name=}")
+        print(f"bbbbbbb {shard_id=}")
+        print(f"bbbbbbb {expert_id=}")
+        if use_bitsandbytes_4bit or use_bitsandbytes_8bit:
             shard_dim = 0
 
             expert_data = param.data[expert_id]
